@@ -10,9 +10,12 @@ Extracts:
   - Signal Rate (MCPS) via raw register
   - Ambient Count via raw register
 
+Ground-truth distance is measured automatically by an HC-SR04 ultrasonic sensor.
+
 Requirements:
   pip install adafruit-circuitpython-vl53l0x
   pip install smbus2
+  pip install RPi.GPIO
 """
 
 import time
@@ -22,7 +25,69 @@ import adafruit_vl53l0x
 import smbus2
 import csv
 import os
+import statistics
+import RPi.GPIO as GPIO
 from datetime import datetime
+
+# ─────────────────────────────────────────────
+# HC-SR04 ULTRASONIC SENSOR (ground-truth)
+# ─────────────────────────────────────────────
+HCSR04_TRIG_PIN = 23   # GPIO pin connected to TRIG
+HCSR04_ECHO_PIN = 24   # GPIO pin connected to ECHO
+HCSR04_TIMEOUT  = 0.04 # 40 ms max echo wait (~6.8 m range)
+SOUND_SPEED_MPS = 343.0
+
+def setup_ultrasonic():
+    """Initialise GPIO for HC-SR04."""
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(HCSR04_TRIG_PIN, GPIO.OUT)
+    GPIO.setup(HCSR04_ECHO_PIN, GPIO.IN)
+    GPIO.output(HCSR04_TRIG_PIN, False)
+    time.sleep(0.05)  # let the sensor settle
+
+def measure_ultrasonic_mm():
+    """
+    Take a single HC-SR04 distance measurement.
+    Returns distance in mm, or None on timeout/error.
+    """
+    # Send 10 µs trigger pulse
+    GPIO.output(HCSR04_TRIG_PIN, True)
+    time.sleep(0.00001)
+    GPIO.output(HCSR04_TRIG_PIN, False)
+
+    deadline = time.monotonic() + HCSR04_TIMEOUT
+
+    # Wait for echo to go HIGH
+    while GPIO.input(HCSR04_ECHO_PIN) == 0:
+        if time.monotonic() > deadline:
+            return None
+    pulse_start = time.monotonic()
+
+    # Wait for echo to go LOW
+    while GPIO.input(HCSR04_ECHO_PIN) == 1:
+        if time.monotonic() > deadline:
+            return None
+    pulse_end = time.monotonic()
+
+    duration_s = pulse_end - pulse_start
+    distance_mm = (duration_s * SOUND_SPEED_MPS / 2.0) * 1000.0
+    return round(distance_mm, 1)
+
+def measure_ultrasonic_averaged(n=9):
+    """
+    Take n HC-SR04 measurements, drop outliers (top & bottom),
+    and return the median in mm. Returns None if too many failures.
+    """
+    readings = []
+    for _ in range(n):
+        d = measure_ultrasonic_mm()
+        if d is not None and 20 < d < 4000:  # sensor valid range: 2 cm – 4 m
+            readings.append(d)
+        time.sleep(0.06)  # HC-SR04 needs ≥ 60 ms between pings
+
+    if len(readings) < 3:
+        return None
+    return round(statistics.median(readings), 1)
 
 # ─────────────────────────────────────────────
 # RAW REGISTER ADDRESSES (VL53L0X datasheet)
@@ -180,7 +245,6 @@ def burst_sample(sensor, bus, n_samples=100, label="unknown", true_distance_mm=N
     ambients    = [r["ambient_count"] for r in readings if r["ambient_count"] is not None]
     dropouts    = sum(1 for r in readings if r["range_status"] != 0)
 
-    import statistics
     stats = {
         "surface":            label,
         "true_distance_mm":   true_distance_mm,
@@ -264,6 +328,9 @@ def probe_sensor(bus):
 # MAIN
 # ─────────────────────────────────────────────
 def main():
+    # --- Setup ultrasonic sensor GPIO ---
+    setup_ultrasonic()
+
     # --- Setup I2C ---
     i2c = busio.I2C(board.SCL, board.SDA)
     sensor = adafruit_vl53l0x.VL53L0X(i2c)
@@ -277,59 +344,71 @@ def main():
     time.sleep(0.1)
     probe_sensor(bus)
 
-    # ── 1. ASK FOR USER INPUT AT THE START OF THE DAY ────────
+    # ── 1. SETUP ──────────────────────────────────────────────
     print("\n" + "="*60)
     print("DAILY LOGGING SETUP")
     print("="*60)
-    
+
     surface = input("Enter the wall type (e.g., white_wall, glass): ")
-    try:
-        true_dist = float(input("Enter actual distance in mm (e.g., 1000): "))
-    except ValueError:
-        print("Invalid number entered. Defaulting to 1000.0 mm")
-        true_dist = 1000.0
 
-    print(f"\nConfiguration Saved: Surface = '{surface}', Distance = {true_dist}mm")
-    print("Initializing 12-hour logging protocol (06:00 to 18:00)...")
-    
+    print("\nMeasuring ground-truth distance with HC-SR04 ultrasonic sensor...")
+    true_dist = measure_ultrasonic_averaged(n=9)
+    if true_dist is None:
+        print("[WARNING] Ultrasonic sensor failed to get a valid reading.")
+        try:
+            true_dist = float(input("Enter actual distance manually in mm (fallback): "))
+        except ValueError:
+            true_dist = 1000.0
+            print(f"Invalid input. Defaulting to {true_dist} mm.")
+    else:
+        print(f"Ultrasonic ground-truth distance: {true_dist} mm")
+
+    print(f"\nConfiguration: Surface='{surface}', Distance={true_dist} mm")
+    print("Starting logging protocol...")
+
     # ── 2. MAIN LOGGING LOOP ─────────────────────────────────
-    while True:
-        now = datetime.now()
-        
-        # Stop condition: If it is 6:00 PM (18:00) or later, end the script
-        if now.hour >= 24:
-            print(f"\n[{now.strftime('%H:%M:%S')}] 6:00 PM reached. Daily logging complete!")
-            break
-            
-        # Wait condition: If it is before 6:00 AM, wait and check again in 1 minute
-        if now.hour < 0:
-            print(f"[{now.strftime('%H:%M:%S')}] Waiting for 6:00 AM to begin...", end="\r")
-            time.sleep(60)
-            continue
-            
-        # Logging condition: Between 6:00 AM and 5:59 PM
-        print(f"\n[{now.strftime('%H:%M:%S')}] Starting 10-minute data collection burst...")
-        
-        # Take the burst reading (100 samples)
-        raw_readings, summary = burst_sample(
-            sensor, bus,
-            n_samples=100, 
-            label=surface,
-            true_distance_mm=true_dist
-        )
+    try:
+        while True:
+            now = datetime.now()
 
-        # Save to CSV files
-        append_to_csv(RAW_CSV, RAW_FIELDS, raw_readings)
-        append_to_csv(SUMMARY_CSV, SUMMARY_FIELDS, summary)
+            if now.hour >= 24:
+                print(f"\n[{now.strftime('%H:%M:%S')}] End of logging window. Done!")
+                break
 
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Data saved to CSVs.")
-        print("Sleeping for 10 minutes...\n")
-        
-        # Sleep for 10 minutes (600 seconds) before the next reading
-        time.sleep(300)
+            if now.hour < 0:
+                print(f"[{now.strftime('%H:%M:%S')}] Waiting for logging window...", end="\r")
+                time.sleep(60)
+                continue
 
-    bus.close()
-    print("\n✓ System gracefully shut down.")
+            # Re-measure ground-truth distance before each burst
+            print(f"\n[{now.strftime('%H:%M:%S')}] Re-measuring ground-truth distance...")
+            updated_dist = measure_ultrasonic_averaged(n=9)
+            if updated_dist is not None:
+                true_dist = updated_dist
+                print(f"  Updated ground-truth: {true_dist} mm")
+            else:
+                print(f"  Ultrasonic read failed — keeping last value: {true_dist} mm")
+
+            print(f"[{now.strftime('%H:%M:%S')}] Starting data collection burst...")
+
+            raw_readings, summary = burst_sample(
+                sensor, bus,
+                n_samples=100,
+                label=surface,
+                true_distance_mm=true_dist
+            )
+
+            append_to_csv(RAW_CSV, RAW_FIELDS, raw_readings)
+            append_to_csv(SUMMARY_CSV, SUMMARY_FIELDS, summary)
+
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Data saved to CSVs.")
+            print("Sleeping for 5 minutes...\n")
+            time.sleep(300)
+
+    finally:
+        bus.close()
+        GPIO.cleanup()
+        print("\n✓ System gracefully shut down.")
 
 if __name__ == "__main__":
     main()
